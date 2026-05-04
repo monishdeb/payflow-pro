@@ -1,0 +1,700 @@
+<?php
+
+/*
++----------------------------------------------------------------------------+
+| Payflow Pro Core Payment Module for CiviCRM version 5                      |
++----------------------------------------------------------------------------+
+| Licensed to CiviCRM under the Academic Free License version 3.0            |
+|                                                                            |
+| Written & Contributed by Eileen McNaughton - 2009                          |
++---------------------------------------------------------------------------+
+ */
+
+use Civi\Api4\PaymentToken;
+use CRM_Payflowpro_ExtensionUtil as E;
+use Brick\Money\Money;
+use Civi\Api4\ContributionRecur;
+use Civi\Api4\PayflowPro;
+use Civi\PayflowPro\Api;
+use Civi\Payment\Exception\PaymentProcessorException;
+use Civi\Payment\PropertyBag;
+use GuzzleHttp\Client;
+
+/**
+ * Class CRM_Core_Payment_PayflowPro.
+ */
+class CRM_Core_Payment_PayflowPro extends CRM_Core_Payment {
+
+  use CRM_Core_Payment_MJWTrait;
+
+  /**
+   * GuzzleHttp client.
+   *
+   * @var \GuzzleHttp\Client
+   */
+  public Client $guzzleClient;
+
+  /**
+   * Reference to the API used to communicate with PayFlowPro.
+   *
+   * @var \Civi\PayflowPro\Api
+   */
+  private Api $api;
+
+  /**
+   * Sets the client.
+   *
+   * @return \GuzzleHttp\Client
+   *   GuzzleHttp client.
+   */
+  public function getGuzzleClient(): Client {
+    return $this->guzzleClient ?? new Client();
+  }
+
+  /**
+   * Sets the client to the passed in client.
+   *
+   * @param \GuzzleHttp\Client $guzzleClient
+   *   GuzzleHttp client.
+   */
+  public function setGuzzleClient(Client $guzzleClient) {
+    $this->guzzleClient = $guzzleClient;
+  }
+
+  /**
+   * Constructor.
+   *
+   * @param string $mode
+   *   The mode of operation: live or test.
+   * @param array $paymentProcessor
+   *   The array of information for the payment processor.
+   */
+  public function __construct($mode, &$paymentProcessor) {
+    $this->_paymentProcessor = $paymentProcessor;
+    $this->api = new Api($this);
+  }
+
+  /**
+   * Return the payment form fields.
+   *
+   * @return array
+   */
+  public function getPaymentFormFields(): array {
+    return ['credit_card_type', 'credit_card_number', 'cvv2', 'credit_card_exp_date'];
+  }
+
+  /**
+   * Return an array of all the details about the fields potentially required for payment fields.
+   *
+   * Only those determined by getPaymentFormFields will actually be assigned to the form.
+   *
+   * @return array
+   *   field metadata
+   */
+  public function getPaymentFormFieldsMetadata(): array {
+    $metadata = parent::getPaymentFormFieldsMetadata();
+    $paymentFields = $this->getPaymentFormFields();
+    foreach ($metadata as $fieldName => $fieldData) {
+      if (!in_array($fieldName, $paymentFields)) {
+        unset($metadata[$fieldName]);
+      }
+    }
+    return $metadata;
+  }
+
+  /**
+   * This public function checks to see if we have the right processor config values set.
+   *
+   * NOTE: Called by Events and Contribute to check config params are set prior to trying
+   *  register any credit card details.
+   *
+   * @return string|null
+   *   the error message if any, null if OK
+   */
+  public function checkConfig() {
+    $errorMsg = [];
+    if (empty($this->_paymentProcessor['user_name'])) {
+      $errorMsg[] = ' ' . ts('Merchant login ID is not set for this payment processor');
+    }
+
+    if (empty($this->_paymentProcessor['url_site'])) {
+      $errorMsg[] = ' ' . ts('URL is not set for %1', [1 => $this->_paymentProcessor['name']]);
+    }
+
+    if (!empty($errorMsg)) {
+      return implode('<p>', $errorMsg);
+    }
+    return NULL;
+  }
+
+  /*
+   * This function  sends request and receives response from
+   * the processor. It is the main function for processing on-server
+   * credit card transactions
+   */
+
+  /**
+   * This function collects all the information from a web/api form and invokes
+   * the relevant payment processor specific functions to perform the transaction.
+   *
+   * @param array|\Civi\Payment\PropertyBag $paymentParams
+   *
+   * @param string $component
+   *
+   * @return array
+   *   Result array (containing at least the key payment_status_id)
+   *
+   * @throws \Civi\Payment\Exception\PaymentProcessorException
+   */
+  public function doPayment(&$paymentParams, $component = 'contribute') {
+    /** @var \Civi\Payment\PropertyBag $propertyBag */
+    $propertyBag = $this->beginDoPayment($paymentParams);
+
+    $zeroAmountPayment = $this->processZeroAmountPayment($propertyBag);
+    if ($zeroAmountPayment) {
+      return $zeroAmountPayment;
+    }
+
+    /*
+     * define variables for connecting with the gateway
+     */
+    $payflowApi = new Api($this);
+
+    $payflow_query_array = array_merge(
+      $payflowApi->getQueryArrayAuth(),
+      [
+        // C - Direct Payment using credit card.
+        'TENDER' => 'C',
+        // A - Authorization, S - Sale.
+        'TRXTYPE' => 'S',
+        'ACCTTYPE' => urlencode($paymentParams['credit_card_type']),
+        // @todo Do we need to machinemoney format? ie. 1024.00 or is 1024 ok for API?
+        'AMT' => \Civi::format()->machineMoney($propertyBag->getAmount()),
+        'CURRENCY' => urlencode($propertyBag->getCurrency()),
+        'FIRSTNAME' => $propertyBag->has('firstName') ? $propertyBag->getFirstName() : '',
+        'LASTNAME' => $propertyBag->has('lastName') ? $propertyBag->getLastName() : '',
+        'STREET' => $propertyBag->getBillingStreetAddress(),
+        'CITY' => urlencode($propertyBag->getBillingCity()),
+        'STATE' => urlencode($propertyBag->getBillingStateProvince()),
+        'ZIP' => urlencode($propertyBag->getBillingPostalCode()),
+        'COUNTRY' => urlencode($propertyBag->getBillingCountry()),
+        'EMAIL' => $propertyBag->has('email') ? $propertyBag->getEmail() : '',
+        'CUSTIP' => urlencode($paymentParams['ip_address']),
+        'COMMENT2' => $this->_paymentProcessor['is_test'] ? 'test' : 'live',
+        'INVNUM' => urlencode($propertyBag->getInvoiceID()),
+        'ORDERDESC' => urlencode($propertyBag->getDescription()),
+        'VERBOSITY' => 'MEDIUM',
+        'BILLTOCOUNTRY' => urlencode($propertyBag->getBillingCountry()),
+      ]
+    );
+
+    if ($propertyBag->has('paymentToken') && !empty($propertyBag->getPaymentToken())) {
+      // Card on file
+      $paymentToken = PaymentToken::get(FALSE)
+        ->addWhere('contact_id', '=', $propertyBag->getContactID())
+        ->addWhere('payment_processor_id', '=', $this->getPaymentProcessor()['id'])
+        ->addWhere('id', '=', $propertyBag->getPaymentToken())
+        ->execute()
+        ->first();
+    }
+
+    if (!empty($paymentToken)) {
+      $token = json_decode($paymentToken['token'], TRUE);
+      $payflow_query_array['CARDONFILE'] = $propertyBag->getIsRecur() ? 'MITR': 'MITU';
+      $payflow_query_array['TXID'] = $token['TXID'];
+      $payflow_query_array['ORIGID'] = $token['ORIGID'];
+    }
+    else {
+      $payflow_query_array['ACCT'] = urlencode($paymentParams['credit_card_number']);
+      $payflow_query_array['CVV2'] = $paymentParams['cvv2'];
+      $payflow_query_array['EXPDATE'] = urlencode(sprintf('%02d', (int) $paymentParams['month']) . substr($paymentParams['year'], 2, 2));
+      if ($propertyBag->has('save_payment_token') && !empty($propertyBag->getCustomProperty('save_payment_token'))) {
+        // Save card for future use. CITI = Cardholder Initiated "Initial"
+        $payflow_query_array['CARDONFILE'] = 'CITI';
+      }
+    }
+
+    if ($paymentParams['installments'] == 1) {
+      $paymentParams['is_recur'] = FALSE;
+    }
+
+    if (!empty($paymentParams['is_recur'])) {
+      [$subscription_payflow_query_array, $newPaymentParams] = $payflowApi->addSubscriptionParams($propertyBag->getAmount(), $propertyBag->getRecurFrequencyUnit(), $propertyBag->getRecurFrequencyInterval(), $propertyBag->getRecurInstallments(), FALSE);
+
+      $payflow_query_array = array_merge($payflow_query_array, $subscription_payflow_query_array);
+      $paymentParams = array_merge($paymentParams, $newPaymentParams);
+
+      if (empty($paymentToken) && $propertyBag->has('save_payment_token') && !empty($propertyBag->getCustomProperty('save_payment_token'))) {
+        // Save card for future use. CITR = Cardholder Initiated Transaction, Recurring
+        $payflow_query_array['CARDONFILE'] = 'CITR';
+      }
+    }
+
+    CRM_Utils_Hook::alterPaymentProcessorParams($this, $propertyBag, $payflow_query_array);
+    $payflow_query = $payflowApi->convert_to_nvp($payflow_query_array);
+
+    /*
+     * Check to see if we have a duplicate before we send
+     */
+    // If ($this->checkDupe($params['invoiceID'], $params['contributionID'] ?? NULL)) {
+    //  throw new PaymentProcessorException('It appears that this transaction is a duplicate.  Have you already submitted the form once?  If so there may have been a connection problem.  Check your email for a receipt.  If you do not receive a receipt within 2 hours you can try your transaction again.  If you continue to have problems please contact the site administrator.', 9003);
+    // }.
+    $responseData = $payflowApi->submit_transaction($payflow_query);
+
+    /*
+     * Payment successfully sent to gateway - process the response now
+     */
+    $nvpArray = $payflowApi->processResponseData($responseData);
+
+    switch ($nvpArray['RESULT']) {
+      case 0:
+        // Success.
+        if (!empty($paymentParams['is_recur'])) {
+          // Store the PROFILEID on the recur.
+          ContributionRecur::update(FALSE)
+            ->addWhere('id', '=', $propertyBag->getContributionRecurID())
+            ->addValue('processor_id', $nvpArray['PROFILEID'])
+            ->execute();
+        }
+        $result = $this->setStatusPaymentCompleted([]);
+        // 'trxn_id' is varchar(255) field. returned value is length 12
+        $result['trxn_id'] = ($nvpArray['PNREF'] ?? '') . ($nvpArray['TRXPNREF'] ?? '');
+
+        // Save card info for Card on File
+        if (!empty($nvpArray['TXID']) && $propertyBag->has('save_payment_token') && $propertyBag->getCustomProperty('save_payment_token')) {
+          PaymentToken::create(FALSE)
+            ->addValue('contact_id', $propertyBag->getContactID())
+            ->addValue('payment_processor_id', $this->getPaymentProcessor()['id'])
+            ->addValue('token', json_encode(['ORIGID' => $result['trxn_id'], 'TXID' => $nvpArray['TXID']]))
+            ->addValue('expiry_date', "{$paymentParams['year']}-{$paymentParams['month']}-01 00:00:00")
+            ->addValue('masked_account_number', CRM_Utils_System::mungeCreditCard($paymentParams['credit_card_number']))
+            ->execute();
+        }
+
+        return $result;
+
+        // @todo: Map to actual errors
+      case 1:
+        throw new PaymentProcessorException('There is a payment processor configuration problem. This is usually due to invalid account information or ip restrictions on the account.  You can verify ip restriction by logging         // into Manager.  See Service Settings >> Allowed IP Addresses.   ', 9003);
+
+      case 12:
+        // Hard decline from bank.
+        throw new PaymentProcessorException('Your transaction was declined   ', 9009);
+
+      case 13:
+        // Voice authorization required.
+        throw new PaymentProcessorException('Your Transaction is pending. Contact Customer Service to complete your order.', 9010);
+
+      case 23:
+        // Issue with credit card number or expiration date.
+        throw new PaymentProcessorException('Invalid credit card information. Please re-enter.', 9011);
+
+      case 26:
+        throw new PaymentProcessorException('You have not configured your payment processor with the correct credentials. Make sure you have provided both the "vendor" and the "user" variables ', 9012);
+
+      default:
+        throw new PaymentProcessorException('Error - from payment processor: [' . $nvpArray['RESULT'] . " " . $nvpArray['RESPMSG'] . "] ", 9013);
+    }
+  }
+
+  /**
+   * Submit a refund payment.
+   *
+   * @param array $params
+   *   Assoc array of input parameters for this transaction.
+   *
+   * @return array
+   *
+   * @throws \Civi\Payment\Exception\PaymentProcessorException
+   * @throws \Brick\Money\Exception\UnknownCurrencyException
+   */
+  public function doRefund(&$params) {
+    $requiredParams = ['trxn_id', 'amount'];
+    foreach ($requiredParams as $required) {
+      if (!isset($params[$required])) {
+        $message = 'doRefund: Missing mandatory parameter: ' . $required;
+        $this->api->logError($message);
+        throw new PaymentProcessorException($message);
+      }
+    }
+
+    $propertyBag = PropertyBag::cast($params);
+
+    // Call the API to refund.
+    $payflowApi = new Api($this);
+    $payflow_query_array = $payflowApi->getQueryArrayAuth();
+    $payflow_query_array['TRXTYPE'] = 'C';
+    $payflow_query_array['TENDER'] = 'C';
+    $payflow_query_array['ORIGID'] = $params['trxn_id'];
+    $payflow_query_array['AMT'] = \Civi::format()->machineMoney($propertyBag->getAmount());
+
+    $payflow_query = $payflowApi->convert_to_nvp($payflow_query_array);
+
+    $responseData = $payflowApi->submit_transaction($payflow_query);
+
+    $nvpArray = $payflowApi->processResponseData($responseData);
+
+    switch ($nvpArray['RESULT']) {
+      case 0:
+        // Success.
+        $refundStatus = CRM_Core_PseudoConstant::getKey('CRM_Contribute_BAO_Contribution', 'contribution_status_id', 'Completed');
+        $refundStatusName = 'Completed';
+        break;
+
+      default:
+        $refundStatus = CRM_Core_PseudoConstant::getKey('CRM_Contribute_BAO_Contribution', 'contribution_status_id', 'Failed');
+        $refundStatusName = 'Failed';
+        \Civi::log('payflowpro')->error('Refund failed: ' . $nvpArray['RESPMSG'] . print_r($nvpArray, TRUE));
+    }
+
+    $refundParams = [
+      'refund_trxn_id' => $nvpArray['PNREF'],
+      'refund_status_id' => $refundStatus,
+      'refund_status' => $refundStatusName,
+      'fee_amount' => 0,
+    ];
+    return $refundParams;
+  }
+
+  /**
+   * Does this payment processor support refund?
+   *
+   * @return bool
+   */
+  public function supportsRefund() {
+    return TRUE;
+  }
+
+  /**
+   *
+   */
+  public function supportsRecurring() {
+    return TRUE;
+  }
+
+  /**
+   * We can edit stripe recurring contributions.
+   *
+   * @return bool
+   */
+  public function supportsEditRecurringContribution() {
+    return TRUE;
+  }
+
+  /**
+   * Does this processor support cancelling recurring contributions through code.
+   *
+   * If the processor returns true it must be possible to take action from within CiviCRM
+   * that will result in no further payments being processed.
+   *
+   * @return bool
+   */
+  protected function supportsCancelRecurring() {
+    return TRUE;
+  }
+
+  /**
+   * Does the processor support the user having a choice as to whether to cancel the recurring with the processor?
+   *
+   * If this returns TRUE then there will be an option to send a cancellation request in the cancellation form.
+   *
+   * This would normally be false for processors where CiviCRM maintains the schedule.
+   *
+   * @return bool
+   */
+  protected function supportsCancelRecurringNotifyOptional() {
+    return TRUE;
+  }
+
+  /**
+   * Attempt to cancel the subscription at Stripe.
+   *
+   * @param \Civi\Payment\PropertyBag $propertyBag
+   *
+   * @return array|null[]
+   *
+   * @throws \Civi\Payment\Exception\PaymentProcessorException
+   */
+  public function doCancelRecurring(PropertyBag $propertyBag) {
+    // By default we always notify the processor and we don't give the user the option
+    // because supportsCancelRecurringNotifyOptional() = FALSE.
+    if (!$propertyBag->has('isNotifyProcessorOnCancelRecur')) {
+      // If isNotifyProcessorOnCancelRecur is NOT set then we set our default.
+      $propertyBag->setIsNotifyProcessorOnCancelRecur(TRUE);
+    }
+    $notifyProcessor = $propertyBag->getIsNotifyProcessorOnCancelRecur();
+
+    if (!$notifyProcessor) {
+      return ['message' => \CRM_Payflowpro_ExtensionUtil::ts('Successfully cancelled the subscription in CiviCRM ONLY.')];
+    }
+
+    // Check we have an ID for the recur at PayflowPro (the PROFILEID)
+    if (!$propertyBag->has('recurProcessorID')) {
+      $errorMessage = \CRM_Payflowpro_ExtensionUtil::ts('The recurring contribution cannot be cancelled (No reference (processor_id) found).');
+      \Civi::log('payflowpro')->error($errorMessage);
+      throw new PaymentProcessorException($errorMessage);
+    }
+
+    // Call the API to cancel the subscription.
+    $payflowApi = new Api($this);
+    $payflow_query_array = $payflowApi->getQueryArrayAuth();
+    $payflow_query_array['TRXTYPE'] = 'R';
+    $payflow_query_array['ACTION'] = 'C';
+    $payflow_query_array['ORIGPROFILEID'] = $propertyBag->getRecurProcessorID();
+
+    $payflow_query = $payflowApi->convert_to_nvp($payflow_query_array);
+
+    $responseData = $payflowApi->submit_transaction($payflow_query);
+
+    $nvpArray = $payflowApi->processResponseData($responseData);
+
+    switch ($nvpArray['RESULT']) {
+      case 0:
+        // Success.
+        return ['message' => \CRM_Payflowpro_ExtensionUtil::ts('Successfully cancelled the subscription at PayflowPro.')];
+
+      default:
+        throw new PaymentProcessorException(\CRM_Payflowpro_ExtensionUtil::ts('Could not cancel PayflowPro subscription: %1', [1 => $nvpArray['RESPMSG']]));
+    }
+  }
+
+  /**
+   * Change the amount of the recurring payment.
+   *
+   * @param string $message
+   * @param array $params
+   *
+   * @return bool|object
+   *
+   * @throws \Civi\Payment\Exception\PaymentProcessorException
+   */
+  public function changeSubscriptionAmount(&$message = '', $params = []) {
+    // We only support the following params: amount.
+    $propertyBag = $this->beginChangeSubscriptionAmount($params);
+    try {
+      // Get the PayflowPro subscription.
+      $existingRecur = ContributionRecur::get(FALSE)
+        ->addWhere('id', '=', $propertyBag->getContributionRecurID())
+        ->execute()
+        ->first();
+
+      // Check what info PayflowPro currently holds about the subscription.
+      $payflowSubscriptionDetails = PayflowPro::getRecurPaymentHistory(FALSE)
+        ->setPaymentProcessorID($this->getID())
+        ->setRecurProfileID($existingRecur['processor_id'])
+        ->setPaymentHistoryType('N')
+        ->execute()
+        ->first();
+      if (isset($payflowSubscriptionDetails['amount']) && is_numeric($payflowSubscriptionDetails['amount'])) {
+        $existingRecur['amount'] = $payflowSubscriptionDetails['amount'];
+      }
+
+      // Check if amount has actually changed!
+      if (Money::of($existingRecur['amount'], mb_strtoupper($existingRecur['currency']))
+        ->isAmountAndCurrencyEqualTo(Money::of($propertyBag->getAmount(), $propertyBag->getCurrency()))) {
+        // @todo: Don't need to throw exception. Return FALSE + message
+        throw new PaymentProcessorException('Amount is the same as before!');
+      }
+
+      // Call the API to update the subscription amount.
+      $payflowApi = new Api($this);
+      $payflow_query_array = $payflowApi->getQueryArrayAuth();
+      $payflow_query_array['TRXTYPE'] = 'R';
+      $payflow_query_array['TENDER'] = 'C';
+      $payflow_query_array['ACTION'] = 'M';
+      $payflow_query_array['ORIGPROFILEID'] = $propertyBag->getRecurProcessorID();
+      $payflow_query_array['AMT'] = \Civi::format()->machineMoney($propertyBag->getAmount());
+
+      $payflow_query = $payflowApi->convert_to_nvp($payflow_query_array);
+
+      $responseData = $payflowApi->submit_transaction($payflow_query);
+
+      $nvpArray = $payflowApi->processResponseData($responseData);
+
+      switch ($nvpArray['RESULT']) {
+        case 0:
+          // Success.
+          \Civi::log('payflowpro')->info('Update subscription success: ' . print_r($nvpArray, TRUE));
+          break;
+
+        default:
+          throw new PaymentProcessorException('Update Subscription Failed: ' . print_r($nvpArray, TRUE));
+      }
+    }
+    catch (Exception $e) {
+      // On ANY failure, throw an exception which will be reported back to the user.
+      $this->api->logError('Update Subscription failed for RecurID: ' . $propertyBag->getContributionRecurID() . ' Error: ' . $e->getMessage());
+      throw new PaymentProcessorException('Update Subscription Failed: ' . $e->getMessage(), $e->getCode(), $params);
+    }
+
+    return TRUE;
+  }
+
+  /**
+   * Update payment details at Authorize.net.
+   *
+   * @param string $message
+   * @param array $params
+   *
+   * @return bool|object
+   *
+   * @throws \Civi\Payment\Exception\PaymentProcessorException
+   */
+  public function updateSubscriptionBillingInfo(&$message = '', $params = []) {
+    $propertyBag = $this->beginUpdateSubscriptionBillingInfo($params);
+
+    try {
+      // Call the API to update the subscription amount.
+      $payflowApi = new Api($this);
+      $payflow_query_array = $payflowApi->getQueryArrayAuth();
+      $payflow_query_array['TRXTYPE'] = 'R';
+      $payflow_query_array['TENDER'] = 'C';
+      $payflow_query_array['ACTION'] = 'M';
+      $payflow_query_array['ORIGPROFILEID'] = $propertyBag->getRecurProcessorID();
+      // Credit card number.
+      $payflow_query_array['ACCT'] = $propertyBag->getCustomProperty('credit_card_number');
+      // CVV.
+      $payflow_query_array['CVV2'] = $propertyBag->getCustomProperty('cvv2');
+      $expDate = $propertyBag->getCustomProperty('credit_card_exp_date');
+      $expDateFormatted = date('my', strtotime($expDate['Y'] . $expDate['M'] . '01000000'));
+      // Expiry card.
+      $payflow_query_array['EXPDATE'] = $expDateFormatted;
+      $payflow_query_array['BILLTOFIRSTNAME'] = $propertyBag->getFirstName();
+      $payflow_query_array['BILLTOLASTNAME'] = $propertyBag->getLastName();
+      $payflow_query_array['BILLTOSTREET'] = $propertyBag->getBillingStreetAddress();
+      $payflow_query_array['BILLTOCITY'] = $propertyBag->getBillingCity();
+      $payflow_query_array['BILLTOSTATE'] = $propertyBag->getBillingStateProvince();
+      $payflow_query_array['BILLTOZIP'] = $propertyBag->getBillingPostalCode();
+      $payflow_query_array['BILLTOCOUNTRY'] = $propertyBag->getBillingCountry();
+
+      $payflow_query = $payflowApi->convert_to_nvp($payflow_query_array);
+
+      $responseData = $payflowApi->submit_transaction($payflow_query);
+
+      $nvpArray = $payflowApi->processResponseData($responseData);
+
+      switch ($nvpArray['RESULT']) {
+        case 0:
+          // Success.
+          \Civi::log('payflowpro')->info('Update billing details success: ' . print_r($nvpArray, TRUE));
+          break;
+
+        default:
+          throw new PaymentProcessorException('Update billing details failed: ' . print_r($nvpArray, TRUE));
+      }
+    }
+    catch (Exception $e) {
+      // On ANY failure, throw an exception which will be reported back to the user.
+      $this->api->logError('Update billing details failed for RecurID: ' . $propertyBag->getContributionRecurID() . ' Error: ' . $e->getMessage());
+      throw new PaymentProcessorException('Update billing details failed: ' . $e->getMessage(), $e->getCode(), $params);
+    }
+
+    return TRUE;
+  }
+
+  /**
+   * Get an array of the fields that can be edited on the recurring contribution.
+   *
+   * Some payment processors support editing the amount and other scheduling details of recurring payments, especially
+   * those which use tokens. Others are fixed. This function allows the processor to return an array of the fields that
+   * can be updated from the contribution recur edit screen.
+   *
+   * The fields are likely to be a subset of these
+   *  - 'amount',
+   *  - 'installments',
+   *  - 'frequency_interval',
+   *  - 'frequency_unit',
+   *  - 'cycle_day',
+   *  - 'next_sched_contribution_date',
+   *  - 'end_date',
+   * - 'failure_retry_day',
+   *
+   * The form does not restrict which fields from the contribution_recur table can be added (although if the html_type
+   * metadata is not defined in the xml for the field it will cause an error.
+   *
+   * Open question - would it make sense to return membership_id in this - which is sometimes editable and is on that
+   * form (UpdateSubscription).
+   *
+   * @return array
+   */
+  public function getEditableRecurringScheduleFields() {
+    if ($this->supports('changeSubscriptionAmount')) {
+      return ['amount'];
+    }
+    return [];
+  }
+
+  /**
+   * Default payment instrument validation.
+   *
+   * @param array $values
+   *   The form values for the contribution.
+   * @param array $errors
+   *   The array of errors for the form values.
+   *
+   * @return void
+   */
+  public function validatePaymentInstrument($values, &$errors) {
+    // Check to see if we are processing a recurring contribution.
+    if (array_key_exists('is_recur', $values) && $values['is_recur'] == TRUE) {
+      // Make sure the frequency unit is not set to day as this has not been implemented yet.
+      if (array_key_exists('frequency_unit', $values) && $values['frequency_unit'] === 'day') {
+        $errors['frequency_unit'] = \CRM_Payflowpro_ExtensionUtil::ts('Current implementation does not support recurring with frequency "day"');
+        return;
+      }
+    }
+
+    $mandatoryFields = $this->getMandatoryFields();
+    if (isset($values['payment_token']) && ($values['payment_token'] != 0)) {
+      // If we have a payment token, we don't need card fields
+      unset($mandatoryFields['credit_card_number'], $mandatoryFields['cvv2'], $mandatoryFields['credit_card_exp_date']);
+    }
+    CRM_Core_Form::validateMandatoryFields($mandatoryFields, $values, $errors);
+    if (isset($values['payment_token']) && ($values['payment_token'] == 0)) {
+      // If we don't have a payment token - ie. we're using card details, we need to validate those details
+      CRM_Core_Payment_Form::validateCreditCard($values, $errors, $this->_paymentProcessor['id']);
+    }
+  }
+
+  protected function getCreditCardFormFields() {
+    $fields = parent::getCreditCardFormFields();
+    return $fields;
+  }
+
+
+  /**
+   * Set default values when loading the (payment) form
+   *
+   * @param \CRM_Core_Form $form
+   */
+  public function buildForm(&$form) {
+    // Get any saved cards for the current contact and payment processor
+    // and put them on the payment form with a select element so you can
+    // select "none" to enter new details or a saved card to use an existing one.
+    CRM_Core_Region::instance('billing-block-pre')->add([
+      'template' => E::path('templates/CRM/Core/BillingBlockPayflowPro.tpl'),
+      'weight' => -1,
+    ]);
+
+    if (empty(CRM_Core_Session::getLoggedInContactID())) {
+      // Can't save card details if no contact ID.
+      return FALSE;
+    }
+
+    $cards = PaymentToken::get(FALSE)
+      ->addSelect('id', 'masked_account_number', 'expiry_date')
+      ->addWhere('contact_id', '=', CRM_Core_Session::getLoggedInContactID())
+      ->addWhere('payment_processor_id', '=', $this->getPaymentProcessor()['id'])
+      ->execute();
+    foreach ($cards as $card) {
+      $listOfCards[$card['id']] = $card['masked_account_number'] . ' - ' . date('m/y', strtotime($card['expiry_date']));
+    }
+    if (!empty($listOfCards)) {
+      $form->add('select', 'payment_token', E::ts('Use Saved Card'),
+        ['0' => E::ts('- none -')] + $listOfCards, FALSE);
+    }
+    $form->add('checkbox', 'save_payment_token', E::ts('Save card details for future use?'));
+    return FALSE;
+  }
+
+}
