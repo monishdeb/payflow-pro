@@ -426,6 +426,49 @@ class Api {
   }
 
   /**
+   * Get the status of a PayFlowPro recurring profile via an inquiry call.
+   *
+   * The PROFILESTATUS field returned by PayflowPro can be one of:
+   *   - ACTIVE: Profile is active and payments are being processed.
+   *   - INACTIVE: Profile exists but is not yet active.
+   *   - CANCEL: Profile has been cancelled (either by merchant or by PayPal
+   *             due to exceeding MAXFAILPAYMENTS).
+   *   - SUSPEND: Profile is temporarily suspended.
+   *
+   * NOTE: PayflowPro does not send webhooks/IPN for profile cancellations.
+   * This method must be called explicitly (e.g. via a scheduled job) to detect
+   * when PayPal has auto-cancelled a profile due to exceeded MAXFAILPAYMENTS.
+   *
+   * @param string $recurProfileID
+   *   The ContributionRecur.processor_id eg. RT0000000027
+   *
+   * @return array Keys: 'status' (string), 'raw' (full nvpArray response).
+   * @throws \Civi\Payment\Exception\PaymentProcessorException
+   * @throws \GuzzleHttp\Exception\GuzzleException
+   */
+  public function getProfileStatus(string $recurProfileID): array {
+    $payflow_query_array = $this->getQueryArrayAuth();
+    $payflow_query_array['TRXTYPE'] = 'R';
+    $payflow_query_array['ACTION'] = 'I';
+    $payflow_query_array['ORIGPROFILEID'] = $recurProfileID;
+    // Use PAYMENTHISTORY=N to get profile info only (no payment list).
+    $payflow_query_array['PAYMENTHISTORY'] = 'N';
+
+    $payflow_query = $this->convert_to_nvp($payflow_query_array);
+    $responseData = $this->submit_transaction($payflow_query);
+    $nvpArray = $this->processResponseData($responseData);
+
+    if ((int) $nvpArray['RESULT'] > 0) {
+      throw new PaymentProcessorException($nvpArray['RESPMSG'] ?? 'Unknown error from PayflowPro inquiry');
+    }
+
+    return [
+      'status' => $nvpArray['STATUS'] ?? '',
+      'raw' => $nvpArray,
+    ];
+  }
+
+  /**
    * Reactivate a cancelled PayFlowPro subscription
    *
    * @param string $recurProfileID
@@ -505,15 +548,32 @@ class Api {
     // description of the goods or
     // services being purchased.
     // This parameter applies only for ACH_CCD accounts.
-    // The
-    // $payflow_query_array['MAXFAILPAYMENTS']   = 0;
-    // number of payment periods (as s
-    // pecified by PAYPERIOD) for which the transaction is allowed
-    // to fail before PayPal cancels a profile.  the default
-    // value of 0 (zero) specifies no
-    // limit. Retry
-    // attempts occur until the term is complete.
-    // $payflow_query_array['RETRYNUMDAYS'] = (not set as can't assume business rule
+
+    // MAXFAILPAYMENTS: Number of payment periods (as specified by PAYPERIOD) for
+    // which the transaction is allowed to fail before PayPal cancels the profile.
+    // The default value of 0 (zero) specifies no limit; retry attempts occur until
+    // the term is complete.
+    // WARNING: Failures are counted across the entire lifetime of the profile, not
+    // per billing period. A value of 3 means the profile is cancelled after any 3
+    // failures total, even if they occur months apart.
+    // Recommended: leave at 0 to prevent accidental auto-cancellation.
+    $maxFailPayments = (int) \Civi::settings()->get('payflowpro_maxfailpayments');
+    $payflow_query_array['MAXFAILPAYMENTS'] = ($maxFailPayments >= 0) ? $maxFailPayments : 0;
+
+    // RETRYNUMDAYS: Number of days to retry a failed payment before waiting until
+    // the next billing period. PayPal will attempt the payment once per day for
+    // this many days. Minimum: 1, maximum: 4.
+    // NOTE: PayflowPro does not automatically retry when payment/CC info is updated
+    // mid-cycle. If a contact updates their card details, a manual retry or
+    // reactivation may be required to collect payment before the next billing cycle.
+    $retryNumDays = (int) \Civi::settings()->get('payflowpro_retrynumdays');
+    if ($retryNumDays >= 1 && $retryNumDays <= 4) {
+      $payflow_query_array['RETRYNUMDAYS'] = $retryNumDays;
+    }
+    else {
+      // Default to 1 if the value is out of range.
+      $payflow_query_array['RETRYNUMDAYS'] = 1;
+    }
     if ($frequencyUnit === 'day') {
       throw new PaymentProcessorException('Current implementation does not support recurring with frequency "day"');
     }

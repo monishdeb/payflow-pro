@@ -2,6 +2,7 @@
 
 namespace Civi\PayflowPro;
 
+use Civi\Api4\Activity;
 use Civi\Api4\Contribution;
 use Civi\Api4\ContributionRecur;
 use Psr\Log\LogLevel;
@@ -164,6 +165,129 @@ class RecurIPN {
     }
 
     return $results ?? [];
+  }
+
+  /**
+   * Check active recurring contributions against PayflowPro and detect profiles
+   * that have been cancelled by PayPal (e.g. due to exceeding MAXFAILPAYMENTS).
+   *
+   * When a profile cancellation is detected:
+   *  - The CiviCRM ContributionRecur status is updated to "Cancelled".
+   *  - A CiviCRM "Payment Processor Notification" activity is created on the
+   *    contact's record so staff can take action (e.g. contact the member or
+   *    reactivate the profile).
+   *
+   * NOTE: PayflowPro does not push notifications when a profile is auto-cancelled.
+   * This method must be called on a schedule (e.g. daily) to detect cancellations.
+   *
+   * @param array $recurProfileIDs
+   *   Optional list of specific profile IDs to check. If empty, all active
+   *   recurring contributions for the payment processor are checked.
+   *
+   * @return array  Results keyed by ContributionRecur ID.
+   * @throws \CRM_Core_Exception
+   */
+  public function checkCancelledProfiles(array $recurProfileIDs = []): array {
+    $paymentProcessor = $this->getPaymentProcessor();
+    if (!$paymentProcessor instanceof \CRM_Core_Payment_PayflowPro) {
+      return [];
+    }
+
+    $payflowAPI = new Api($paymentProcessor);
+
+    $contributionRecurApi = ContributionRecur::get(FALSE)
+      ->addSelect('id', 'contact_id', 'processor_id', 'contribution_status_id:name', 'amount', 'currency', 'frequency_unit', 'frequency_interval')
+      ->addWhere('is_test', '=', $this->getPaymentProcessor()->getIsTestMode())
+      ->addWhere('payment_processor_id', '=', $this->paymentProcessorID)
+      ->addWhere('contribution_status_id:name', 'IN', ['In Progress', 'Pending'])
+      ->addWhere('processor_id', 'IS NOT EMPTY');
+    if (!empty($recurProfileIDs)) {
+      $contributionRecurApi->addWhere('processor_id', 'IN', $recurProfileIDs);
+    }
+    $contributionRecurs = $contributionRecurApi->execute();
+
+    $results = [];
+    foreach ($contributionRecurs as $contributionRecur) {
+      $profileID = $contributionRecur['processor_id'];
+      try {
+        $profileStatus = $payflowAPI->getProfileStatus($profileID);
+        $status = strtoupper($profileStatus['status'] ?? '');
+        $results[$contributionRecur['id']]['profile_status'] = $status;
+
+        if ($status === 'CANCEL') {
+          // PayPal has cancelled this profile (e.g. due to MAXFAILPAYMENTS exceeded).
+          // Update the CiviCRM recurring contribution status to Cancelled.
+          ContributionRecur::update(FALSE)
+            ->addWhere('id', '=', $contributionRecur['id'])
+            ->addValue('contribution_status_id:name', 'Cancelled')
+            ->addValue('cancel_date', date('Y-m-d H:i:s'))
+            ->addValue('cancel_reason', 'Automatically cancelled by PayPal (payment processor). Profile ID: ' . $profileID)
+            ->execute();
+
+          // Create a staff alert activity on the contact's record.
+          $this->createCancellationAlert($contributionRecur, $profileID);
+
+          $results[$contributionRecur['id']]['cancelled'] = TRUE;
+          \Civi::log('payflowpro')->warning('PayflowPro: Profile ' . $profileID . ' has been cancelled by PayPal. ContributionRecur ID: ' . $contributionRecur['id'] . '. Contact ID: ' . $contributionRecur['contact_id']);
+        }
+        else {
+          $results[$contributionRecur['id']]['cancelled'] = FALSE;
+        }
+      }
+      catch (\Exception $e) {
+        $results[$contributionRecur['id']]['error'] = $e->getMessage();
+        \Civi::log('payflowpro')->error('PayflowPro: Error checking profile status for ' . $profileID . ': ' . $e->getMessage());
+      }
+    }
+
+    return $results;
+  }
+
+  /**
+   * Create a CiviCRM activity to alert staff that a recurring profile has been
+   * cancelled by PayPal.
+   *
+   * Staff can use this activity as a queue to review cancelled profiles and
+   * take action such as contacting the member or reactivating the profile via
+   * the reactivate button on the ContributionRecur record.
+   *
+   * @param array $contributionRecur  The ContributionRecur record.
+   * @param string $profileID         The PayflowPro profile ID.
+   *
+   * @return void
+   * @throws \CRM_Core_Exception
+   */
+  private function createCancellationAlert(array $contributionRecur, string $profileID): void {
+    $recurUrl = \CRM_Utils_System::url(
+      'civicrm/contact/view/contributionrecur',
+      ['reset' => 1, 'id' => $contributionRecur['id'], 'cid' => $contributionRecur['contact_id']],
+      TRUE
+    );
+    $subject = \CRM_Payflowpro_ExtensionUtil::ts(
+      'PayflowPro recurring profile cancelled by PayPal - Profile ID: %1',
+      [1 => $profileID]
+    );
+    $details = \CRM_Payflowpro_ExtensionUtil::ts(
+      'The PayflowPro recurring profile %1 has been automatically cancelled by PayPal. ' .
+      'This may be due to exceeding the maximum number of failed payment attempts (MAXFAILPAYMENTS). ' .
+      'The recurring contribution (ID: %2) has been marked as Cancelled in CiviCRM. ' .
+      'Please review and take action: contact the member to update payment details, then reactivate the profile. ' .
+      'View recurring contribution: %3',
+      [
+        1 => $profileID,
+        2 => $contributionRecur['id'],
+        3 => $recurUrl,
+      ]
+    );
+
+    Activity::create(FALSE)
+      ->addValue('activity_type_id:name', 'Payment Processor Notification')
+      ->addValue('status_id:name', 'Scheduled')
+      ->addValue('subject', $subject)
+      ->addValue('details', $details)
+      ->addValue('target_contact_id', $contributionRecur['contact_id'])
+      ->addValue('source_contact_id', $contributionRecur['contact_id'])
+      ->execute();
   }
 
 }
