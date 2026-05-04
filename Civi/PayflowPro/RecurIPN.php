@@ -282,6 +282,8 @@ class RecurIPN {
 
     Activity::create(FALSE)
       ->addValue('activity_type_id:name', 'Payment Processor Notification')
+      // Use 'Scheduled' status so the activity appears as an open task in staff dashlets,
+      // prompting review and action (e.g. contact the member, reactivate the profile).
       ->addValue('status_id:name', 'Scheduled')
       ->addValue('subject', $subject)
       ->addValue('details', $details)

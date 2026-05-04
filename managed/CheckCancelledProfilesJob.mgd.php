@@ -19,7 +19,7 @@ return [
         'api_entity' => 'PayflowPro',
         'api_action' => 'checkCancelledProfiles',
         'parameters' => 'version=4
-paymentProcessorID=1',
+' . "# Update paymentProcessorID to match your PayflowPro payment processor ID (see Administer > Payment Processors).\n" . 'paymentProcessorID=1',
       ],
     ],
   ],

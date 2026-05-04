@@ -428,7 +428,7 @@ class Api {
   /**
    * Get the status of a PayFlowPro recurring profile via an inquiry call.
    *
-   * The PROFILESTATUS field returned by PayflowPro can be one of:
+   * The STATUS field returned by PayflowPro can be one of:
    *   - ACTIVE: Profile is active and payments are being processed.
    *   - INACTIVE: Profile exists but is not yet active.
    *   - CANCEL: Profile has been cancelled (either by merchant or by PayPal
@@ -442,7 +442,7 @@ class Api {
    * @param string $recurProfileID
    *   The ContributionRecur.processor_id eg. RT0000000027
    *
-   * @return array Keys: 'status' (string), 'raw' (full nvpArray response).
+   * @return array Keys: 'status' (string from PayflowPro STATUS field), 'raw' (full nvpArray response).
    * @throws \Civi\Payment\Exception\PaymentProcessorException
    * @throws \GuzzleHttp\Exception\GuzzleException
    */
