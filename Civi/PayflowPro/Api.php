@@ -505,15 +505,22 @@ class Api {
     // description of the goods or
     // services being purchased.
     // This parameter applies only for ACH_CCD accounts.
-    // The
-    // $payflow_query_array['MAXFAILPAYMENTS']   = 0;
-    // number of payment periods (as s
-    // pecified by PAYPERIOD) for which the transaction is allowed
-    // to fail before PayPal cancels a profile.  the default
-    // value of 0 (zero) specifies no
-    // limit. Retry
-    // attempts occur until the term is complete.
-    // $payflow_query_array['RETRYNUMDAYS'] = (not set as can't assume business rule
+
+    // MAXFAILPAYMENTS: Number of billing periods (as specified by PAYPERIOD) for which a failed
+    // payment is allowed before PayPal auto-cancels the profile. Default 0 = no limit (recommended).
+    // WARNING: This counts total failures across the entire profile lifetime, not per billing period.
+    // Setting to a non-zero value (e.g. 3) will cancel the profile after 3 failures even if they
+    // are months apart. Use 0 to prevent accidental auto-cancellation; rely on staff notifications instead.
+    $maxFailPayments = (int) (\Civi::settings()->get('payflowpro_maxfailpayments') ?? 0);
+    $payflow_query_array['MAXFAILPAYMENTS'] = max(0, $maxFailPayments);
+
+    // RETRYNUMDAYS: Number of days to retry a failed payment before waiting until the next billing
+    // cycle. Valid values: 1–4. Default: 1.
+    // Note: PayPal does not automatically retry when card details are updated mid-cycle; a manual
+    // reactivation or period-payment action (ACTION=P) would be required to trigger an early retry.
+    $retryNumDays = (int) (\Civi::settings()->get('payflowpro_retrynumdays') ?? 1);
+    $payflow_query_array['RETRYNUMDAYS'] = min(4, max(1, $retryNumDays));
+
     if ($frequencyUnit === 'day') {
       throw new PaymentProcessorException('Current implementation does not support recurring with frequency "day"');
     }

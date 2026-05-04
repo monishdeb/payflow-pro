@@ -151,6 +151,18 @@ class RecurIPN {
             ];
             $this->updateContributionFailed($failedContributionParams);
 
+            // Send email notification to configured staff/admin addresses.
+            $emailNotifier = new EmailNotifier();
+            $emailNotifier->sendFailureNotification(
+              $contributionRecur,
+              $contribution,
+              [
+                'failure_reason' => $payflowRecurPayment['status_id:name_description'],
+                'failure_code' => $payflowRecurPayment['TRANSTATE'] ?? '',
+                'trxn_id' => $payflowRecurPayment['trxn_id'],
+              ]
+            );
+
             $results['recur'][$contributionRecur['id']]['contributions'][$contribution['id']]['failed'] = TRUE;
             break;
 
