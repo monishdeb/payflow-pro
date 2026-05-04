@@ -451,6 +451,26 @@ class CRM_Core_Payment_PayflowPro extends CRM_Core_Payment {
     switch ($nvpArray['RESULT']) {
       case 0:
         // Success.
+        // Send email notification to configured staff/admin addresses.
+        if ($propertyBag->has('contributionRecurID')) {
+          try {
+            $contributionRecur = ContributionRecur::get(FALSE)
+              ->addWhere('id', '=', $propertyBag->getContributionRecurID())
+              ->execute()
+              ->first();
+            if (!empty($contributionRecur)) {
+              $emailNotifier = new \Civi\PayflowPro\EmailNotifier();
+              $emailNotifier->sendCancellationNotification(
+                $contributionRecur,
+                E::ts('Recurring payment profile cancelled at PayflowPro.')
+              );
+            }
+          }
+          catch (\Exception $e) {
+            // Non-fatal — log but don't block the cancellation response.
+            \Civi::log('payflowpro')->warning('doCancelRecurring: Could not send cancellation email: ' . $e->getMessage());
+          }
+        }
         return ['message' => \CRM_Payflowpro_ExtensionUtil::ts('Successfully cancelled the subscription at PayflowPro.')];
 
       default:
